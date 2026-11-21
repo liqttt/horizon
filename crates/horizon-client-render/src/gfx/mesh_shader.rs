@@ -490,6 +490,7 @@ struct PageGpu {
     uniform_slots: u32,
     bind_group: wgpu::BindGroup,
     uploaded_revision: u64,
+    uploaded_full_layout: bool,
     prepared_passes: [Option<PreparedPass>; PASS_SLOTS as usize],
 }
 
@@ -658,6 +659,7 @@ impl MeshSectionStore {
                         uniform_slots,
                         bind_group,
                         uploaded_revision: 0,
+                        uploaded_full_layout: false,
                         prepared_passes: [const { None }; PASS_SLOTS as usize],
                     });
                 }
@@ -667,6 +669,7 @@ impl MeshSectionStore {
                         pg.storage = storage;
                         pg.storage_capacity = cap;
                         pg.uploaded_revision = 0;
+                        pg.uploaded_full_layout = false;
                     }
                     if let Some(uniform) = uniform {
                         pg.uniform = uniform;
@@ -722,9 +725,14 @@ impl MeshSectionStore {
             .gpu_pages
             .get_mut(&page)
             .expect("page GPU storage must exist after allocation");
-        if rebuilt || needs_storage_alloc || pg.uploaded_revision != revision {
+        if rebuilt
+            || needs_storage_alloc
+            || pg.uploaded_revision != revision
+            || !pg.uploaded_full_layout
+        {
             queue.write_buffer(&pg.storage, 0, bytemuck::cast_slice(staged));
             pg.uploaded_revision = revision;
+            pg.uploaded_full_layout = true;
             pg.prepared_passes = [const { None }; PASS_SLOTS as usize];
         }
 
@@ -826,6 +834,7 @@ impl MeshSectionStore {
             let staged = &self.table.pages[&page].visible_staging;
             queue.write_buffer(&pg.storage, 0, bytemuck::cast_slice(staged));
             pg.uploaded_revision = revision;
+            pg.uploaded_full_layout = false;
 
             let mut prepare_range = |pass_kind: u32, start: u32, count: u32, limit: u32| {
                 if count == 0 {

@@ -10119,7 +10119,10 @@ impl Renderer {
             );
         }
         let oit = self.oit.as_ref().filter(|_| oit_on);
-        let cull = self.cull.as_ref().filter(|_| culling && solid_draws > 0);
+        let cull = self
+            .cull
+            .as_ref()
+            .filter(|_| culling && (solid_draws > 0 || (mesh_frame && !visible.is_empty())));
         let pack_sky_clear = pack_draws_sky
             .then(|| self.pack_post.as_ref().and_then(|p| p.1.as_ref()))
             .flatten()
