@@ -271,6 +271,31 @@ struct Sky {
     textured: Option<Pass>,
 }
 
+/// Which part of the entity passes runs at a frame step: opaque/early before deferred (`Early`),
+/// `PreWater` (`gbuffers_beaconbeam`) after deferred but before `gbuffers_water` so underwater
+/// beams are not occluded by water depth writes, and `Late` after `gbuffers_water`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntityPhase {
+    Early,
+    PreWater,
+    Late,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranslucentStep {
+    PreWaterEntities,
+    WaterTerrain,
+    LateEntities,
+}
+
+/// Production draw order inside [`PackPost::draw_translucent`]: `gbuffers_beaconbeam` runs
+/// before translucent water writes depth so underwater beams remain visible (#20345).
+const TRANSLUCENT_STEPS: [TranslucentStep; 3] = [
+    TranslucentStep::PreWaterEntities,
+    TranslucentStep::WaterTerrain,
+    TranslucentStep::LateEntities,
+];
+
 /// Entities, block entities, translucent entity parts and particles a pack draws
 /// (`pack_entities::ENTITY`... order), after terrain or, `late`, after deferred; Horizon draws
 /// the others.
@@ -2899,12 +2924,13 @@ impl PackPost {
         };
         let mut kind = 0;
         let entity_passes = programs.map(|p| {
+            let program_kind = kind;
             // The entity program draws the boats, and their water patches (`Draw::water_mask`).
-            water_mask_next.set(kind == super::pack_entities::ENTITY);
+            water_mask_next.set(program_kind == super::pack_entities::ENTITY);
             kind += 1;
             p.zip(entity_geometry.as_ref()).and_then(|(p, g)| {
-                if p.name == "gbuffers_damagedblock" {
-                    let decal = Geometry {
+                if !Self::entity_depth_write(program_kind, &p.name) {
+                    let no_depth = Geometry {
                         buffers: g.buffers,
                         table: g.table,
                         depth_write: false,
@@ -2913,7 +2939,7 @@ impl PackPost {
                         ids: g.ids,
                         cull: false,
                     };
-                    paged(build(p, Some(&decal)))
+                    paged(build(p, Some(&no_depth)))
                 } else {
                     paged(build(p, Some(g)))
                 }
@@ -4146,8 +4172,21 @@ impl PackPost {
         *self.terrain_slot(list, cutout) = Some(pass);
     }
 
+    fn entity_depth_write(program: usize, name: &str) -> bool {
+        name != "gbuffers_damagedblock" && program != super::pack_entities::BEAM
+    }
+
+    fn entity_in_phase(program: usize, late: bool, phase: EntityPhase) -> bool {
+        match phase {
+            EntityPhase::Early => !late,
+            EntityPhase::PreWater => late && program == super::pack_entities::BEAM,
+            EntityPhase::Late => late && program != super::pack_entities::BEAM,
+        }
+    }
+
     /// Entities, block entities, translucent entity parts and particles with the pack's
-    /// programs, those drawn before deferred or (`late`) after: each run `prepare_entities` kept
+    /// programs, those drawn before deferred (`Early`), between deferred and translucent terrain
+    /// (`PreWater`), or after translucent terrain (`Late`): each run `prepare_entities` kept
     /// is one draw with its own `entityId` or `blockEntityId` and `entityColor`.
     fn draw_entities(
         &mut self,
@@ -4155,14 +4194,17 @@ impl PackPost {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         size: [u32; 2],
-        late: bool,
+        phase: EntityPhase,
     ) {
         let Some(mut entities) = self.entities.take() else {
             return;
         };
         let geometry = &entities.geometry;
         for (program, pass) in entities.passes.iter_mut().enumerate() {
-            let Some(pass) = pass.as_mut().filter(|_| entities.late[program] == late) else {
+            let Some(pass) = pass
+                .as_mut()
+                .filter(|_| Self::entity_in_phase(program, entities.late[program], phase))
+            else {
                 continue;
             };
             let mut draws = geometry
@@ -4477,7 +4519,7 @@ impl PackPost {
             self.draw_sky(device, queue, encoder, size, frame);
         }
         self.draw_terrain(device, queue, encoder, size, TerrainList::Solid, terrain);
-        self.draw_entities(device, queue, encoder, size, false);
+        self.draw_entities(device, queue, encoder, size, EntityPhase::Early);
         self.draw_lines(device, queue, encoder, size);
         self.draw_clouds(device, queue, encoder, size);
         // Only depth2 excludes the opaque first-person hand.
@@ -4654,7 +4696,8 @@ impl PackPost {
         self.cloud_draw = clouds.filter(|c| c.quads > 0);
     }
 
-    /// Translucent terrain, then the entity parts drawn after deferred.
+    /// Beacon beams (before water depth writes), translucent terrain, then the remaining late
+    /// entity parts.
     fn draw_translucent(
         &mut self,
         device: &wgpu::Device,
@@ -4663,15 +4706,26 @@ impl PackPost {
         size: [u32; 2],
         terrain: &mut TerrainDraw<'_>,
     ) {
-        self.draw_terrain(
-            device,
-            queue,
-            encoder,
-            size,
-            TerrainList::Translucent,
-            terrain,
-        );
-        self.draw_entities(device, queue, encoder, size, true);
+        for step in TRANSLUCENT_STEPS {
+            match step {
+                TranslucentStep::PreWaterEntities => {
+                    self.draw_entities(device, queue, encoder, size, EntityPhase::PreWater);
+                }
+                TranslucentStep::WaterTerrain => {
+                    self.draw_terrain(
+                        device,
+                        queue,
+                        encoder,
+                        size,
+                        TerrainList::Translucent,
+                        terrain,
+                    );
+                }
+                TranslucentStep::LateEntities => {
+                    self.draw_entities(device, queue, encoder, size, EntityPhase::Late);
+                }
+            }
+        }
         self.draw_hand_water(device, queue, encoder, size);
         self.draw_weather(device, queue, encoder, size);
     }
@@ -6619,6 +6673,245 @@ mod tests {
         assert!(source("shadow", false, true, true) == Source::ShadowDepth(1, false));
         assert!(source("watershadow", false, true, true) == Source::ShadowDepth(0, false));
         assert!(source("shadowtex1HW", false, true, false) == Source::ShadowDepth(1, true));
+    }
+
+    #[test]
+    fn beacon_beam_draws_in_pre_water_phase() {
+        use super::super::pack_entities::{BEAM, ENTITY, PARTICLE_TRANSLUCENT};
+        // Beacon beam is scheduled after deferred (`late == true`), but must draw in `PreWater`
+        // before translucent water writes depth (#20345).
+        assert!(PackPost::entity_in_phase(BEAM, true, EntityPhase::PreWater));
+        assert!(!PackPost::entity_in_phase(BEAM, true, EntityPhase::Late));
+        assert!(!PackPost::entity_in_phase(BEAM, true, EntityPhase::Early));
+        assert!(PackPost::entity_in_phase(ENTITY, false, EntityPhase::Early));
+        assert!(PackPost::entity_in_phase(
+            PARTICLE_TRANSLUCENT,
+            true,
+            EntityPhase::Late
+        ));
+    }
+
+    #[test]
+    fn beacon_beam_pre_water_phase_remains_visible_behind_translucent_water_gpu() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((_adapter, device, queue)) = crate::gfx::test_gpu::optional_device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let wgsl = "
+            struct VsOut {
+                @builtin(position) pos: vec4<f32>,
+                @location(0) color: vec4<f32>,
+            };
+            @vertex fn vs_beam_far(@builtin(vertex_index) i: u32) -> VsOut {
+                let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VsOut(vec4(p[i], 0.8, 1.0), vec4(1.0, 1.0, 1.0, 1.0));
+            }
+            @vertex fn vs_water_near(@builtin(vertex_index) i: u32) -> VsOut {
+                let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VsOut(vec4(p[i], 0.3, 1.0), vec4(0.0, 0.25, 1.0, 0.5));
+            }
+            @vertex fn vs_beam_near(@builtin(vertex_index) i: u32) -> VsOut {
+                let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VsOut(vec4(p[i], 0.3, 1.0), vec4(1.0, 0.0, 0.0, 0.5));
+            }
+            @vertex fn vs_water_far(@builtin(vertex_index) i: u32) -> VsOut {
+                let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VsOut(vec4(p[i], 0.8, 1.0), vec4(0.0, 0.0, 1.0, 1.0));
+            }
+            @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+                return in.color;
+            }
+        ";
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let make_pipeline = |vs: &str, depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let beam_depth_write =
+            PackPost::entity_depth_write(super::super::pack_entities::BEAM, "gbuffers_beaconbeam");
+        assert!(!beam_depth_write);
+        let beam_far = make_pipeline("vs_beam_far", beam_depth_write);
+        let water_near = make_pipeline("vs_water_near", true);
+        let beam_near = make_pipeline("vs_beam_near", beam_depth_write);
+        let water_far = make_pipeline("vs_water_far", true);
+
+        let render = |steps: &[TranslucentStep],
+                      beam: &wgpu::RenderPipeline,
+                      water: &wgpu::RenderPipeline| {
+            let color = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let color_view = color.create_view(&Default::default());
+            let depth_view = depth.create_view(&Default::default());
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                for &step in steps {
+                    match step {
+                        TranslucentStep::PreWaterEntities
+                            if PackPost::entity_in_phase(
+                                super::super::pack_entities::BEAM,
+                                true,
+                                EntityPhase::PreWater,
+                            ) =>
+                        {
+                            rp.set_pipeline(beam);
+                            rp.draw(0..3, 0..1);
+                        }
+                        TranslucentStep::LateEntities
+                            if PackPost::entity_in_phase(
+                                super::super::pack_entities::BEAM,
+                                true,
+                                EntityPhase::Late,
+                            ) =>
+                        {
+                            rp.set_pipeline(beam);
+                            rp.draw(0..3, 0..1);
+                        }
+                        TranslucentStep::WaterTerrain => {
+                            rp.set_pipeline(water);
+                            rp.draw(0..3, 0..1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            enc.copy_texture_to_buffer(
+                color.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([enc.finish()]);
+            let slice = readback.slice(..4);
+            slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = slice.get_mapped_range().unwrap();
+            [data[0], data[1], data[2], data[3]]
+        };
+
+        // Pre-fix order (water before beam): water depth (0.3) occludes beam (0.8), leaving R == 0.
+        let post_water = render(
+            &[
+                TranslucentStep::WaterTerrain,
+                TranslucentStep::PreWaterEntities,
+            ],
+            &beam_far,
+            &water_near,
+        );
+        assert_eq!(post_water[0], 0);
+        // Production scheduling (`TRANSLUCENT_STEPS` + `entity_in_phase`): underwater beam is visible.
+        let pre_water = render(&TRANSLUCENT_STEPS, &beam_far, &water_near);
+        assert!(
+            pre_water[0] >= 120,
+            "expected underwater beam red channel, got {pre_water:?}"
+        );
+        // Farther water behind the beam (`z = 0.8` behind `z = 0.3`) must still pass depth test
+        // because `entity_depth_write(BEAM, ...)` disables depth writes.
+        let farther_water = render(&TRANSLUCENT_STEPS, &beam_near, &water_far);
+        assert!(
+            farther_water[2] >= 250,
+            "expected farther water blue channel behind beam, got {farther_water:?}"
+        );
     }
 }
 
