@@ -64,6 +64,16 @@ fn inventory_after_mode(screen: Screen, creative: bool) -> Screen {
     }
 }
 
+/// Vertical velocity upon entering spectator mode: clears the residual downward gravity
+/// velocity held while standing on solid ground so `no_physics` does not pull the player down.
+fn spectator_entry_velocity_y(was_spectator: bool, on_ground: bool, velocity_y: f64) -> f64 {
+    if !was_spectator && on_ground {
+        0.0
+    } else {
+        velocity_y
+    }
+}
+
 impl Game<'_> {
     /// `InventoryScreen.containerTick` and `CreativeModeInventoryScreen.containerTick`
     /// on a mode change: the inventory the player has open follows the mode.
@@ -132,6 +142,8 @@ impl Game<'_> {
             self.left = false;
             self.dismount_for_spectator();
             if let Some(p) = self.player.as_mut() {
+                p.velocity.y =
+                    spectator_entry_velocity_y(was_spectator, p.ground.on_ground, p.velocity.y);
                 p.flying = true;
                 p.spectator = true;
             }
@@ -177,6 +189,7 @@ impl Game<'_> {
         self.mode_changed_under_inventory();
     }
 }
+
 impl Game<'_> {
     /// `ItemStack.canBreakBlockInAdventureMode` / `canPlaceOnBlockInAdventureMode`
     /// for the main-hand stack: some predicate of its `can_break` or
@@ -510,5 +523,43 @@ mod tests {
         let _ = game.tick();
         assert!(game.screen == Screen::Inventory);
         assert_eq!(game.carried.as_ref().map(|c| c.count), Some(3));
+    }
+
+    #[test]
+    fn entering_spectator_on_ground_clears_residual_gravity_velocity() {
+        assert_eq!(super::spectator_entry_velocity_y(false, true, -0.0784), 0.0);
+        assert_eq!(
+            super::spectator_entry_velocity_y(false, false, -0.35),
+            -0.35
+        );
+        assert_eq!(super::spectator_entry_velocity_y(true, false, -0.1), -0.1);
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn switching_to_spectator_on_ground_preserves_y_position() {
+        if std::env::var_os("HORIZON_TEST_RESOURCES").is_none() {
+            return;
+        }
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            let start_y = 64.0_f64;
+            let mut player = horizon_client::motion::PlayerMotion::new(
+                game.motion,
+                horizon_core::geometry::Vec3::new(0.5, start_y, 0.5),
+            )
+            .unwrap();
+            player.ground.on_ground = true;
+            // Stationary ground ticks leave residual downward gravity velocity (`-gravity * drag`).
+            player.velocity.y = -0.0784;
+            game.player = Some(player);
+            game.set_mode(horizon_client::command::args::GameMode::Survival);
+            game.set_mode(horizon_client::command::args::GameMode::Spectator);
+
+            let p = game.player.as_ref().unwrap();
+            assert!(p.spectator);
+            assert!(p.flying);
+            assert_eq!(p.velocity.y, 0.0);
+            assert_eq!(p.position.y, start_y);
+        });
     }
 }
