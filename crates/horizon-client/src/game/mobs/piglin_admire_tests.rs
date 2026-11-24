@@ -119,6 +119,50 @@ fn piglin_admire_hit_keeps_baby_gold_and_cancels_adult_barter() {
     });
 }
 
+#[test]
+#[ignore = "daily"]
+fn piglin_inside_scaffolding_picks_up_gold_at_its_feet() {
+    mod_platform::testing::with_mods(Vec::new().into(), || {
+        with_game(|g| {
+            g.build_registries();
+            let loot = horizon_world::loot::LootData::load(
+                &g.options.resources,
+                &Default::default(),
+                g.res.item_defaults(),
+            )
+            .unwrap();
+            g.server_loot.set(Some(std::sync::Arc::new(loot)));
+            g.set_allow_commands(true);
+            g.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            assert!(g.run_command("setblock 0 99 0 minecraft:stone"));
+            assert!(g.run_command("setblock 0 100 0 minecraft:scaffolding"));
+
+            assert!(
+                g.run_command("summon minecraft:piglin 0.5 100 0.5 {IsImmuneToZombification:1b}")
+            );
+            g.mobs[0].extra.set_main_hand(None);
+            g.mobs[0].extra.age = 0;
+            let id = g.mobs[0].id;
+            g.creatures.ticked.insert(id);
+            g.spawn_item(
+                ItemStack::new("minecraft:gold_ingot", 1),
+                [0.5, 100.0, 0.5],
+                [0.0; 3],
+                0,
+            );
+            g.piglin_pickups();
+            assert!(
+                item_stack(&g.mobs[0], OFFHAND).is_some(),
+                "piglin standing inside scaffolding should pick up gold at its feet"
+            );
+            assert!(g.dropped.is_empty());
+        })
+    });
+}
+
 /// `Piglin.wantsToPickUp`: a piglin saved with `CanPickUpLoot:0b` leaves gold on the ground.
 #[test]
 #[ignore = "daily"]

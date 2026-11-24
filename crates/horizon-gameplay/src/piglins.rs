@@ -281,9 +281,11 @@ pub fn piglin_pickups<L: PiglinLevel + ?Sized>(l: &mut L) {
             .filter(|&(j, _)| l.piglin_wants(m, &dropped[j].stack))
             .filter(|&(j, _)| {
                 // ItemEntity's eye height is 0.2125.
+                // Pass the piglin's feet Y so `CollisionContext.of(piglin)` treats
+                // scaffolding occupied by the piglin as open rather than its stable top slab.
                 let e = &dropped[j];
                 let at = Vec3::new(e.position.x, e.position.y + 0.2125, e.position.z);
-                w.line_of_sight(eye, at)
+                w.line_of_sight_for(Some(pos.y), eye, at)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1));
         let loved = nearest.is_some_and(|(j, _)| l.piglin_loved(&dropped[j].stack.item));
