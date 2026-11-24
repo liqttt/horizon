@@ -283,6 +283,7 @@ pub fn piglin_pickups<L: PiglinLevel + ?Sized>(l: &mut L) {
                 // ItemEntity's eye height is 0.2125.
                 // Pass the piglin's feet Y so `CollisionContext.of(piglin)` treats
                 // scaffolding occupied by the piglin as open rather than its stable top slab.
+                // Position-only context is sufficient because piglins never hold scaffolding.
                 let e = &dropped[j];
                 let at = Vec3::new(e.position.x, e.position.y + 0.2125, e.position.z);
                 w.line_of_sight_for(Some(pos.y), eye, at)

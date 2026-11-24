@@ -121,7 +121,7 @@ fn piglin_admire_hit_keeps_baby_gold_and_cancels_adult_barter() {
 
 #[test]
 #[ignore = "daily"]
-fn piglin_inside_scaffolding_picks_up_gold_at_its_feet() {
+fn piglin_inside_scaffolding_sees_gold_outside_reach() {
     mod_platform::testing::with_mods(Vec::new().into(), || {
         with_game(|g| {
             g.build_registries();
@@ -139,6 +139,7 @@ fn piglin_inside_scaffolding_picks_up_gold_at_its_feet() {
             );
             assert!(g.run_command("setblock 0 99 0 minecraft:stone"));
             assert!(g.run_command("setblock 0 100 0 minecraft:scaffolding"));
+            assert!(g.run_command("setblock 1 98 0 minecraft:stone"));
 
             assert!(
                 g.run_command("summon minecraft:piglin 0.5 100 0.5 {IsImmuneToZombification:1b}")
@@ -149,16 +150,16 @@ fn piglin_inside_scaffolding_picks_up_gold_at_its_feet() {
             g.creatures.ticked.insert(id);
             g.spawn_item(
                 ItemStack::new("minecraft:gold_ingot", 1),
-                [0.5, 100.0, 0.5],
+                [1.95, 99.0, 0.5],
                 [0.0; 3],
                 0,
             );
             g.piglin_pickups();
-            assert!(
-                item_stack(&g.mobs[0], OFFHAND).is_some(),
-                "piglin standing inside scaffolding should pick up gold at its feet"
+            assert_eq!(
+                g.mobs[0].extra.point,
+                Some([1.95, 99.0, 0.5]),
+                "piglin standing inside scaffolding should see gold outside immediate reach"
             );
-            assert!(g.dropped.is_empty());
         })
     });
 }

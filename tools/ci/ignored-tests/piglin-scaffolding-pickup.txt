@@ -1,0 +1,1 @@
+horizon-client game::piglin_admire_tests::piglin_inside_scaffolding_sees_gold_outside_reach lib daily resources
