@@ -498,6 +498,9 @@ struct Pass {
     /// The entity program without colour writes, for the boats' water patches
     /// (`RenderTypes.waterMask`: depth only, so no water shows inside a hull).
     water_mask: Option<Slot<wgpu::RenderPipeline>>,
+    /// The beam program without depth writes, for the beams' translucent glow
+    /// (`RenderTypes.beaconBeam(true)`); the opaque core keeps the program's own pipeline.
+    no_depth_write: Option<Slot<wgpu::RenderPipeline>>,
     layout: wgpu::BindGroupLayout,
     ubo: wgpu::Buffer,
     block: Vec<u8>,
@@ -1425,6 +1428,16 @@ impl Resources<'_> {
     }
 }
 
+/// A second pipeline [`build_pass`] makes of an entity program, beside its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtraPipeline {
+    None,
+    /// `Pass::water_mask`.
+    WaterMask,
+    /// `Pass::no_depth_write`.
+    NoDepthWrite,
+}
+
 /// A pipeline, made once: `Pipeline`'s, filled by its `Job`.
 type Slot<T> = std::sync::Arc<std::sync::OnceLock<T>>;
 
@@ -1947,7 +1960,7 @@ fn build_pass(
     custom: &[(String, String)],
     draws: &wgpu::BindGroupLayout,
     pack: &Resources<'_>,
-    water_mask: bool,
+    extra: ExtraPipeline,
 ) -> Option<Pass> {
     let features = device.features();
     // The frame's uniforms, then the pack's custom ones.
@@ -2170,7 +2183,7 @@ fn build_pass(
             })
         });
         // The water patches' pipeline: the same program, depth only.
-        let water_mask = water_mask.then(|| {
+        let water_mask = (extra == ExtraPipeline::WaterMask).then(|| {
             let targets = (job.targets.iter())
                 .map(|t| {
                     t.clone().map(|t| wgpu::ColorTargetState {
@@ -2187,14 +2200,28 @@ fn build_pass(
                 },
             )
         });
+        // The beam glow's pipeline: the same program, without depth writes.
+        let no_depth_write = (extra == ExtraPipeline::NoDepthWrite).then(|| {
+            pack.render_pipeline(
+                device,
+                RenderJob {
+                    depth_stencil: job.depth_stencil.clone().map(|d| wgpu::DepthStencilState {
+                        depth_write_enabled: Some(false),
+                        ..d
+                    }),
+                    ..job.clone()
+                },
+            )
+        });
         (
             layout,
             pack.render_pipeline(device, job),
             sky_parts,
             water_mask,
+            no_depth_write,
         )
     });
-    let (layout, pipeline, sky_parts, water_mask) = match created {
+    let (layout, pipeline, sky_parts, water_mask, no_depth_write) = match created {
         Ok(created) => created,
         Err(e) => {
             notes.push(format!("{}: skipped: {e}", p.name));
@@ -2235,6 +2262,7 @@ fn build_pass(
         pipeline: Pipeline::Render(pipeline),
         sky_parts,
         water_mask,
+        no_depth_write,
         layout,
         samplers,
         writes,
@@ -2392,6 +2420,7 @@ fn build_compute(
         },
         sky_parts: None,
         water_mask: None,
+        no_depth_write: None,
         layout,
         samplers,
         writes: Vec::new(),
@@ -2683,8 +2712,9 @@ impl PackPost {
                 })
             })
             .transpose()?;
-        // The next pass built also gets a depth-only pipeline for the boats' water patches.
-        let water_mask_next = std::cell::Cell::new(false);
+        // The next pass built also gets a depth-only pipeline for the boats' water patches, or
+        // one without depth writes for the beams' glow.
+        let extra_next = std::cell::Cell::new(ExtraPipeline::None);
         let mut build = |mut p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
             // Not wanted any more: the rest is skipped and the build refused below.
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2735,7 +2765,7 @@ impl PackPost {
                     &custom_names,
                     &draws.layout,
                     &pack,
-                    water_mask_next.get(),
+                    extra_next.get(),
                 )?
             };
             pass.compute.append(&mut computes);
@@ -2924,13 +2954,17 @@ impl PackPost {
         };
         let mut kind = 0;
         let entity_passes = programs.map(|p| {
-            let program_kind = kind;
-            // The entity program draws the boats, and their water patches (`Draw::water_mask`).
-            water_mask_next.set(program_kind == super::pack_entities::ENTITY);
+            // The entity program draws the boats, and their water patches (`Draw::water_mask`);
+            // the beam program the beams' cores, and their glow (`Draw::beam_glow`).
+            extra_next.set(match kind {
+                super::pack_entities::ENTITY => ExtraPipeline::WaterMask,
+                super::pack_entities::BEAM => ExtraPipeline::NoDepthWrite,
+                _ => ExtraPipeline::None,
+            });
             kind += 1;
             p.zip(entity_geometry.as_ref()).and_then(|(p, g)| {
-                if !Self::entity_depth_write(program_kind, &p.name) {
-                    let no_depth = Geometry {
+                if p.name == "gbuffers_damagedblock" {
+                    let decal = Geometry {
                         buffers: g.buffers,
                         table: g.table,
                         depth_write: false,
@@ -2939,7 +2973,7 @@ impl PackPost {
                         ids: g.ids,
                         cull: false,
                     };
-                    paged(build(p, Some(&no_depth)))
+                    paged(build(p, Some(&decal)))
                 } else {
                     paged(build(p, Some(g)))
                 }
@@ -2950,7 +2984,7 @@ impl PackPost {
         if entity_passes[super::pack_entities::PARTICLE_TRANSLUCENT].is_some() {
             late[super::pack_entities::PARTICLE] = false;
         }
-        water_mask_next.set(false);
+        extra_next.set(ExtraPipeline::None);
         let shadow_entities = shadow_programs.map(|p| {
             p.zip(entity_geometry.as_ref())
                 .and_then(|(p, g)| paged(build(p, Some(g))))
@@ -4172,10 +4206,6 @@ impl PackPost {
         *self.terrain_slot(list, cutout) = Some(pass);
     }
 
-    fn entity_depth_write(program: usize, name: &str) -> bool {
-        name != "gbuffers_damagedblock" && program != super::pack_entities::BEAM
-    }
-
     fn entity_in_phase(program: usize, late: bool, phase: EntityPhase) -> bool {
         match phase {
             EntityPhase::Early => !late,
@@ -4210,12 +4240,17 @@ impl PackPost {
             let mut draws = geometry
                 .draws
                 .iter()
-                .filter(|d| d.pack && d.program == program && !d.water_mask)
+                .filter(|d| d.pack && d.program == program && !d.water_mask && !d.beam_glow)
                 .peekable();
+            // The beams' glow after their cores, without depth writes: what lies behind it
+            // still draws later, and the core keeps its depth (`RenderTypes.beaconBeam`).
+            let glows: Vec<_> = (geometry.draws.iter())
+                .filter(|d| d.pack && d.program == program && d.beam_glow)
+                .collect();
             let masks: Vec<_> = (geometry.draws.iter())
                 .filter(|d| d.pack && d.program == program && d.water_mask)
                 .collect();
-            if draws.peek().is_none() {
+            if draws.peek().is_none() && glows.is_empty() {
                 continue;
             }
             let group = self.bind(device, queue, encoder, pass, size);
@@ -4254,6 +4289,19 @@ impl PackPost {
                         rp.set_bind_group(2, &geometry.group, &[geometry.offset(d.slot)]);
                     }
                     rp.draw_indexed(0..d.quads * 6, d.base as i32, 0..1);
+                }
+                if !glows.is_empty() {
+                    if on_portal {
+                        rp.set_bind_group(0, &group, &[]);
+                    }
+                    let glow = pass.no_depth_write.as_ref().and_then(|p| p.get());
+                    rp.set_pipeline(glow.unwrap_or_else(|| pass.render()));
+                    for d in &glows {
+                        if pass.draw {
+                            rp.set_bind_group(2, &geometry.group, &[geometry.offset(d.slot)]);
+                        }
+                        rp.draw_indexed(0..d.quads * 6, d.base as i32, 0..1);
+                    }
                 }
             }
             // The boats' water patches, depth only, into their own depth: translucent terrain
@@ -6481,7 +6529,7 @@ mod tests {
             &[],
             &draws.layout,
             &pack,
-            false,
+            ExtraPipeline::None,
         )
         .unwrap_or_else(|| panic!("the pass builds: {notes:?}"));
         // colortex3 holds (0.75, 0.5, 0.25, 0.5) before the pass.
@@ -6711,9 +6759,13 @@ mod tests {
                 let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
                 return VsOut(vec4(p[i], 0.3, 1.0), vec4(0.0, 0.25, 1.0, 0.5));
             }
-            @vertex fn vs_beam_near(@builtin(vertex_index) i: u32) -> VsOut {
+            @vertex fn vs_glow_near(@builtin(vertex_index) i: u32) -> VsOut {
                 let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
                 return VsOut(vec4(p[i], 0.3, 1.0), vec4(1.0, 0.0, 0.0, 0.5));
+            }
+            @vertex fn vs_core_near(@builtin(vertex_index) i: u32) -> VsOut {
+                let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VsOut(vec4(p[i], 0.3, 1.0), vec4(1.0, 0.0, 0.0, 1.0));
             }
             @vertex fn vs_water_far(@builtin(vertex_index) i: u32) -> VsOut {
                 let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
@@ -6765,12 +6817,12 @@ mod tests {
                 cache: None,
             })
         };
-        let beam_depth_write =
-            PackPost::entity_depth_write(super::super::pack_entities::BEAM, "gbuffers_beaconbeam");
-        assert!(!beam_depth_write);
-        let beam_far = make_pipeline("vs_beam_far", beam_depth_write);
+        // The beam program's own pipeline writes depth (the core); its `no_depth_write` one
+        // (the glow, `Draw::beam_glow`) does not.
+        let beam_far = make_pipeline("vs_beam_far", true);
         let water_near = make_pipeline("vs_water_near", true);
-        let beam_near = make_pipeline("vs_beam_near", beam_depth_write);
+        let core_near = make_pipeline("vs_core_near", true);
+        let glow_near = make_pipeline("vs_glow_near", false);
         let water_far = make_pipeline("vs_water_far", true);
 
         let render = |steps: &[TranslucentStep],
@@ -6905,12 +6957,19 @@ mod tests {
             pre_water[0] >= 120,
             "expected underwater beam red channel, got {pre_water:?}"
         );
-        // Farther water behind the beam (`z = 0.8` behind `z = 0.3`) must still pass depth test
-        // because `entity_depth_write(BEAM, ...)` disables depth writes.
-        let farther_water = render(&TRANSLUCENT_STEPS, &beam_near, &water_far);
+        // Farther water (`z = 0.8`) behind the opaque core (`z = 0.3`) stays hidden: the core
+        // keeps its depth, as `RenderTypes.beaconBeam(false)` does.
+        let behind_core = render(&TRANSLUCENT_STEPS, &core_near, &water_far);
+        assert_eq!(
+            behind_core,
+            [255, 0, 0, 255],
+            "water behind the beam's core"
+        );
+        // Behind the glow it still shows: the glow writes no depth (`beaconBeam(true)`).
+        let behind_glow = render(&TRANSLUCENT_STEPS, &glow_near, &water_far);
         assert!(
-            farther_water[2] >= 250,
-            "expected farther water blue channel behind beam, got {farther_water:?}"
+            behind_glow[2] >= 250,
+            "expected farther water blue channel behind the glow, got {behind_glow:?}"
         );
     }
 }
