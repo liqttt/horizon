@@ -66,8 +66,8 @@ fn inventory_after_mode(screen: Screen, creative: bool) -> Screen {
 
 /// Vertical velocity upon entering spectator mode: clears the residual downward gravity
 /// velocity held while standing on solid ground so `no_physics` does not pull the player down.
-fn spectator_entry_velocity_y(was_spectator: bool, on_ground: bool, velocity_y: f64) -> f64 {
-    if !was_spectator && on_ground {
+fn spectator_entry_velocity_y(on_ground: bool, velocity_y: f64) -> f64 {
+    if on_ground && velocity_y < 0.0 {
         0.0
     } else {
         velocity_y
@@ -140,10 +140,11 @@ impl Game<'_> {
             self.mining = None;
             self.stop_active_item_use();
             self.left = false;
+            // Dismount first so a mounted player's post-dismount ground state decides
+            // whether any residual downward velocity is cleared.
             self.dismount_for_spectator();
             if let Some(p) = self.player.as_mut() {
-                p.velocity.y =
-                    spectator_entry_velocity_y(was_spectator, p.ground.on_ground, p.velocity.y);
+                p.velocity.y = spectator_entry_velocity_y(p.ground.on_ground, p.velocity.y);
                 p.flying = true;
                 p.spectator = true;
             }
@@ -527,12 +528,9 @@ mod tests {
 
     #[test]
     fn entering_spectator_on_ground_clears_residual_gravity_velocity() {
-        assert_eq!(super::spectator_entry_velocity_y(false, true, -0.0784), 0.0);
-        assert_eq!(
-            super::spectator_entry_velocity_y(false, false, -0.35),
-            -0.35
-        );
-        assert_eq!(super::spectator_entry_velocity_y(true, false, -0.1), -0.1);
+        assert_eq!(super::spectator_entry_velocity_y(true, -0.0784), 0.0);
+        assert_eq!(super::spectator_entry_velocity_y(true, 0.42), 0.42);
+        assert_eq!(super::spectator_entry_velocity_y(false, -0.35), -0.35);
     }
 
     #[test]
@@ -555,11 +553,29 @@ mod tests {
             game.set_mode(horizon_client::command::args::GameMode::Survival);
             game.set_mode(horizon_client::command::args::GameMode::Spectator);
 
-            let p = game.player.as_ref().unwrap();
-            assert!(p.spectator);
-            assert!(p.flying);
-            assert_eq!(p.velocity.y, 0.0);
-            assert_eq!(p.position.y, start_y);
+            let mut player = game.player.take().unwrap();
+            for _ in 0..5 {
+                horizon_client::motion::MotionWorld {
+                    entities: &[],
+                    player: &mut player,
+                    scene: &mut game.world,
+                    assets: &game.pack.assets,
+                    collision_binding: game.collision,
+                    resources: game.motion,
+                    health: &game.health_resources,
+                    loop_context: &game.loop_context,
+                    damage_hooks: &game.damage_hooks,
+                    tag_items: Some(game.res.items()),
+                    block_registries: Some(&game.pack.block_registries),
+                }
+                .controlled_simulation_tick(Default::default())
+                .unwrap();
+            }
+
+            assert!(player.spectator);
+            assert!(player.flying);
+            assert_eq!(player.velocity.y, 0.0);
+            assert_eq!(player.position.y, start_y);
         });
     }
 }
